@@ -30,6 +30,7 @@ pub trait TableEntry {
 pub struct HashTable<Entry: TableEntry, BH: BuildHasher> {
     table: Option<Box<[Entry]>>,
     hasher: BH,
+    insert_search_limit: usize,
 }
 
 #[derive(Debug)]
@@ -38,9 +39,20 @@ pub enum InsertFailureReason<'a, Value> {
         passed_in_value: Value,
         entry_value: &'a Value,
     },
-    TableFull {
+    TableFullOrSearchLimitHit {
         passed_in_value: Value,
     },
+}
+
+#[derive(Debug)]
+pub struct GetOrInsertSuccess<'a, Value> {
+    passed_in_value: Option<Value>,
+    entry_value: &'a Value,
+}
+
+#[derive(Debug)]
+pub enum GetOrInsertFailureReason<Value> {
+    TableFullOrSearchLimitHit { passed_in_value: Value },
 }
 
 struct TableIndexIter {
@@ -86,14 +98,28 @@ impl<'a, Entry: TableEntry<Value = Value>, Value: 'static> Iterator for HashTabl
 }
 
 impl<Entry: TableEntry<Value = Value>, BH: BuildHasher, Value: 'static> HashTable<Entry, BH> {
-    pub fn with_hasher(mut capacity: usize, hasher: BH) -> Self {
+    pub fn with_search_limit_and_hasher(
+        mut capacity: usize,
+        insert_search_limit: usize,
+        hasher: BH,
+    ) -> Self {
         capacity = capacity
             .checked_next_power_of_two()
             .expect("capacity too big");
         Self {
             table: Some((0..capacity).map(|_| Entry::empty()).collect()),
             hasher,
+            insert_search_limit,
         }
+    }
+    pub fn with_hasher(capacity: usize, hasher: BH) -> Self {
+        Self::with_search_limit_and_hasher(capacity, 32, hasher)
+    }
+    pub fn with_search_limit(capacity: usize, insert_search_limit: usize) -> Self
+    where
+        BH: Default,
+    {
+        Self::with_search_limit_and_hasher(capacity, insert_search_limit, BH::default())
     }
     pub fn new(capacity: usize) -> Self
     where
@@ -113,7 +139,13 @@ impl<Entry: TableEntry<Value = Value>, BH: BuildHasher, Value: 'static> HashTabl
     pub fn hasher(&self) -> &BH {
         &self.hasher
     }
-    fn table_indexes(&self, key: Key) -> impl Iterator<Item = usize> {
+    pub fn insert_search_limit(&self) -> usize {
+        self.insert_search_limit
+    }
+    pub fn set_insert_search_limit(&mut self, insert_search_limit: usize) {
+        self.insert_search_limit = insert_search_limit;
+    }
+    fn table_indexes(&self, key: Key, limit: usize) -> impl Iterator<Item = usize> {
         let mut hasher = self.hasher.build_hasher();
         key.hash(&mut hasher);
         let table_index_mask = self.capacity() - 1;
@@ -122,11 +154,11 @@ impl<Entry: TableEntry<Value = Value>, BH: BuildHasher, Value: 'static> HashTabl
             table_index,
             table_index_mask,
         }
-        .take(self.capacity())
+        .take(self.capacity().min(limit))
     }
     pub fn find(&self, key: Key) -> Option<&Value> {
         let table = self.get_table();
-        for table_index in self.table_indexes(key) {
+        for table_index in self.table_indexes(key, usize::max_value()) {
             let (entry_key, entry_value) = table[table_index].get()?;
             if entry_key == key {
                 return Some(entry_value);
@@ -136,7 +168,7 @@ impl<Entry: TableEntry<Value = Value>, BH: BuildHasher, Value: 'static> HashTabl
     }
     pub fn insert(&self, key: Key, mut value: Value) -> Result<&Value, InsertFailureReason<Value>> {
         let table = self.get_table();
-        for table_index in self.table_indexes(key) {
+        for table_index in self.table_indexes(key, self.insert_search_limit) {
             match table[table_index].fill(key, value) {
                 Ok(entry_value) => return Ok(entry_value),
                 Err(AlreadyFull {
@@ -154,9 +186,31 @@ impl<Entry: TableEntry<Value = Value>, BH: BuildHasher, Value: 'static> HashTabl
                 }
             }
         }
-        Err(InsertFailureReason::TableFull {
+        Err(InsertFailureReason::TableFullOrSearchLimitHit {
             passed_in_value: value,
         })
+    }
+    pub fn get_or_insert(
+        &self,
+        key: Key,
+        value: Value,
+    ) -> Result<GetOrInsertSuccess<Value>, GetOrInsertFailureReason<Value>> {
+        match self.insert(key, value) {
+            Ok(entry_value) => Ok(GetOrInsertSuccess {
+                entry_value,
+                passed_in_value: None,
+            }),
+            Err(InsertFailureReason::AlreadyInTable {
+                entry_value,
+                passed_in_value,
+            }) => Ok(GetOrInsertSuccess {
+                entry_value,
+                passed_in_value: Some(passed_in_value),
+            }),
+            Err(InsertFailureReason::TableFullOrSearchLimitHit { passed_in_value }) => {
+                Err(GetOrInsertFailureReason::TableFullOrSearchLimitHit { passed_in_value })
+            }
+        }
     }
     pub fn drain(&mut self) -> HashTableDrain<Entry> {
         HashTableDrain {
