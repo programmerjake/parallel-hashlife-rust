@@ -109,12 +109,11 @@ impl<Value> SyncTableEntry<Value> {
     }
 }
 
-impl<Value> TableEntry for SyncTableEntry<Value> {
-    type Value = Value;
+impl<Value> TableEntry<Value> for SyncTableEntry<Value> {
     fn empty() -> Self {
         SyncTableEntry::empty()
     }
-    fn get(&self) -> Option<(Key, &Self::Value)> {
+    fn get(&self) -> Option<(Key, &Value)> {
         let key00 = loop {
             match State::from(self.state.load(Ordering::Acquire)) {
                 State::Empty => return None,
@@ -129,7 +128,7 @@ impl<Value> TableEntry for SyncTableEntry<Value> {
             Some((Key([[key00, key01], key1]), &*self.get_value_ptr()))
         }
     }
-    fn fill(&self, key: Key, value: Self::Value) -> Result<&Self::Value, AlreadyFull<Self::Value>> {
+    fn fill(&self, key: Key, value: Value) -> Result<&Value, AlreadyFull<Value>> {
         loop {
             match self
                 .state
@@ -181,7 +180,7 @@ impl<Value> TableEntry for SyncTableEntry<Value> {
             Ok(&*self.get_value_ptr())
         }
     }
-    fn take(&mut self) -> Option<(Key, Self::Value)> {
+    fn take(&mut self) -> Option<(Key, Value)> {
         unsafe {
             match State::from(*self.state.get_mut()) {
                 State::Empty => None,

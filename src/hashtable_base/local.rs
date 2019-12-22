@@ -46,12 +46,11 @@ impl<Value> Drop for LocalTableEntry<Value> {
     }
 }
 
-impl<Value> TableEntry for LocalTableEntry<Value> {
-    type Value = Value;
+impl<Value> TableEntry<Value> for LocalTableEntry<Value> {
     fn empty() -> Self {
         LocalTableEntry::empty()
     }
-    fn get(&self) -> Option<(Key, &Self::Value)> {
+    fn get(&self) -> Option<(Key, &Value)> {
         unsafe {
             let key000 = (*self.key000.get())?;
             let key001 = *self.key001.get();
@@ -61,7 +60,7 @@ impl<Value> TableEntry for LocalTableEntry<Value> {
             Some((Key([[[key000, key001], key01], key1]), value_ref))
         }
     }
-    fn fill(&self, key: Key, value: Self::Value) -> Result<&Self::Value, AlreadyFull<Self::Value>> {
+    fn fill(&self, key: Key, value: Value) -> Result<&Value, AlreadyFull<Value>> {
         if let Some((entry_key, entry_value)) = self.get() {
             Err(AlreadyFull {
                 passed_in_value: value,
@@ -80,7 +79,7 @@ impl<Value> TableEntry for LocalTableEntry<Value> {
             }
         }
     }
-    fn take(&mut self) -> Option<(Key, Self::Value)> {
+    fn take(&mut self) -> Option<(Key, Value)> {
         unsafe {
             let key000 = ((&mut *self.key000.get()).take())?;
             let key001 = *self.key001.get();

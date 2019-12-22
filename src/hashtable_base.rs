@@ -1,6 +1,7 @@
 use std::hash::BuildHasher;
 use std::hash::Hash;
 use std::hash::Hasher;
+use std::marker::PhantomData;
 use std::num::NonZeroU32;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
@@ -19,18 +20,18 @@ pub struct AlreadyFull<'a, Value: 'static> {
     pub entry_value: &'a Value,
 }
 
-pub trait TableEntry {
-    type Value: Sized + 'static;
+pub trait TableEntry<Value: Sized + 'static> {
     fn empty() -> Self;
-    fn get(&self) -> Option<(Key, &Self::Value)>;
-    fn fill(&self, key: Key, value: Self::Value) -> Result<&Self::Value, AlreadyFull<Self::Value>>;
-    fn take(&mut self) -> Option<(Key, Self::Value)>;
+    fn get(&self) -> Option<(Key, &Value)>;
+    fn fill(&self, key: Key, value: Value) -> Result<&Value, AlreadyFull<Value>>;
+    fn take(&mut self) -> Option<(Key, Value)>;
 }
 
-pub struct HashTable<Entry: TableEntry, BH: BuildHasher> {
+pub struct HashTable<Value: Sized + 'static, Entry: TableEntry<Value>, BH: BuildHasher> {
     table: Option<Box<[Entry]>>,
     hasher: BH,
     insert_search_limit: usize,
+    _phantom: PhantomData<Value>,
 }
 
 #[derive(Debug)]
@@ -69,35 +70,41 @@ impl Iterator for TableIndexIter {
     }
 }
 
-pub struct HashTableDrain<'a, Entry: TableEntry> {
+pub struct HashTableDrain<'a, Value: Sized + 'static, Entry: TableEntry<Value>> {
     entry_iter: std::slice::IterMut<'a, Entry>,
+    _phantom: PhantomData<&'a mut Value>,
 }
 
-impl<Entry: TableEntry<Value = Value>, Value: 'static> Iterator for HashTableDrain<'_, Entry> {
+impl<Value: Sized + 'static, Entry: TableEntry<Value>> Iterator
+    for HashTableDrain<'_, Value, Entry>
+{
     type Item = (Key, Value);
     fn next(&mut self) -> Option<(Key, Value)> {
         self.entry_iter.next().and_then(TableEntry::take)
     }
 }
 
-impl<Entry: TableEntry> Drop for HashTableDrain<'_, Entry> {
+impl<Value: Sized + 'static, Entry: TableEntry<Value>> Drop for HashTableDrain<'_, Value, Entry> {
     fn drop(&mut self) {
         self.for_each(std::mem::drop);
     }
 }
 
-pub struct HashTableIter<'a, Entry: TableEntry> {
+pub struct HashTableIter<'a, Value: Sized + 'static, Entry: TableEntry<Value>> {
     entry_iter: std::slice::Iter<'a, Entry>,
+    _phantom: PhantomData<&'a Value>,
 }
 
-impl<'a, Entry: TableEntry<Value = Value>, Value: 'static> Iterator for HashTableIter<'a, Entry> {
+impl<'a, Value: Sized + 'static, Entry: TableEntry<Value>> Iterator
+    for HashTableIter<'a, Value, Entry>
+{
     type Item = (Key, &'a Value);
     fn next(&mut self) -> Option<(Key, &'a Value)> {
         self.entry_iter.next().and_then(TableEntry::get)
     }
 }
 
-impl<Entry: TableEntry<Value = Value>, BH: BuildHasher, Value: 'static> HashTable<Entry, BH> {
+impl<Entry: TableEntry<Value>, BH: BuildHasher, Value: 'static> HashTable<Value, Entry, BH> {
     pub fn with_search_limit_and_hasher(
         mut capacity: usize,
         insert_search_limit: usize,
@@ -110,6 +117,7 @@ impl<Entry: TableEntry<Value = Value>, BH: BuildHasher, Value: 'static> HashTabl
             table: Some((0..capacity).map(|_| Entry::empty()).collect()),
             hasher,
             insert_search_limit,
+            _phantom: PhantomData,
         }
     }
     pub fn with_hasher(capacity: usize, hasher: BH) -> Self {
@@ -212,14 +220,16 @@ impl<Entry: TableEntry<Value = Value>, BH: BuildHasher, Value: 'static> HashTabl
             }
         }
     }
-    pub fn drain(&mut self) -> HashTableDrain<Entry> {
+    pub fn drain(&mut self) -> HashTableDrain<Value, Entry> {
         HashTableDrain {
             entry_iter: self.get_table_mut().iter_mut(),
+            _phantom: PhantomData,
         }
     }
-    pub fn iter(&self) -> HashTableIter<Entry> {
+    pub fn iter(&self) -> HashTableIter<Value, Entry> {
         HashTableIter {
             entry_iter: self.get_table().iter(),
+            _phantom: PhantomData,
         }
     }
 }
@@ -253,7 +263,7 @@ mod tests {
         test_table_entry::<LocalTableEntry<DropCounter>>()
     }
 
-    fn test_table_entry<T: TableEntry<Value = DropCounter>>() {
+    fn test_table_entry<T: TableEntry<DropCounter>>() {
         #![allow(clippy::cognitive_complexity)]
         let drop_count = Arc::new(AtomicUsize::new(0));
         let key = Key([
