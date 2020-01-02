@@ -114,11 +114,21 @@ impl<Value> TableEntry<Value> for SyncTableEntry<Value> {
         SyncTableEntry::empty()
     }
     fn get(&self) -> Option<(Key, &Value)> {
+        let mut backoff_step = 0;
         let key00 = loop {
             match State::from(self.state.load(Ordering::Acquire)) {
                 State::Empty => return None,
                 State::Full { key00 } => break key00,
-                State::ModificationInProgress => spin_loop_hint(),
+                State::ModificationInProgress => {
+                    if backoff_step <= 6 {
+                        for _ in 0..(1 << backoff_step) {
+                            spin_loop_hint()
+                        }
+                        backoff_step += 1;
+                    } else {
+                        std::thread::yield_now();
+                    }
+                }
             }
         };
         // safety: state will never transition from Full to something else while self is shared
