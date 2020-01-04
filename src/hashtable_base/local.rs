@@ -1,42 +1,83 @@
-use super::AlreadyFull;
-use super::Key;
-use super::TableEntry;
+use crate::hashtable_base::AlreadyFull;
+use crate::hashtable_base::Key;
+use crate::hashtable_base::TableEntry;
+use crate::hashtable_base::TableEntryValues;
+use std::cell::Cell;
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
 use std::num::NonZeroU32;
 use std::ptr::drop_in_place;
 
-pub struct LocalTableEntry<Value: 'static> {
+pub struct LocalTableValues<EarlyValue: 'static, LateValue: Copy + 'static> {
+    early_value: EarlyValue,
+    late_value: Cell<Option<LateValue>>,
+}
+
+impl<EarlyValue: 'static, LateValue: Copy + 'static> TableEntryValues
+    for LocalTableValues<EarlyValue, LateValue>
+{
+    type LateValue = LateValue;
+    type EarlyValue = EarlyValue;
+    fn new(early_value: Self::EarlyValue, late_value: Option<Self::LateValue>) -> Self {
+        Self {
+            early_value,
+            late_value: Cell::new(late_value),
+        }
+    }
+    fn early_value(&self) -> &Self::EarlyValue {
+        &self.early_value
+    }
+    fn late_value(&self) -> Option<Self::LateValue> {
+        self.late_value.get()
+    }
+    fn set_late_value(&self, late_value: Option<Self::LateValue>) {
+        self.late_value.set(late_value);
+    }
+}
+
+impl<EarlyValue: 'static, LateValue: Copy + 'static> Into<(EarlyValue, Option<LateValue>)>
+    for LocalTableValues<EarlyValue, LateValue>
+{
+    fn into(self) -> (EarlyValue, Option<LateValue>) {
+        let Self {
+            early_value,
+            late_value,
+        } = self;
+        (early_value, late_value.into_inner())
+    }
+}
+
+pub struct LocalTableEntry<EarlyValue: 'static, LateValue: Copy + 'static> {
     key000: UnsafeCell<Option<NonZeroU32>>,
     key001: UnsafeCell<NonZeroU32>,
     key01: UnsafeCell<[NonZeroU32; 2]>,
     key1: UnsafeCell<[[NonZeroU32; 2]; 2]>,
-    value: UnsafeCell<MaybeUninit<Value>>,
+    value: UnsafeCell<MaybeUninit<LocalTableValues<EarlyValue, LateValue>>>,
 }
 
-impl<Value> LocalTableEntry<Value> {
-    pub const fn empty() -> Self {
-        unsafe {
-            Self {
-                key000: UnsafeCell::new(None),
-                key001: UnsafeCell::new(NonZeroU32::new_unchecked(1)),
-                key01: UnsafeCell::new([NonZeroU32::new_unchecked(1); 2]),
-                key1: UnsafeCell::new([[NonZeroU32::new_unchecked(1); 2]; 2]),
-                value: UnsafeCell::new(MaybeUninit::uninit()),
-            }
+impl<EarlyValue: 'static, LateValue: Copy + 'static> LocalTableEntry<EarlyValue, LateValue> {
+    pub const EMPTY: Self = unsafe {
+        Self {
+            key000: UnsafeCell::new(None),
+            key001: UnsafeCell::new(NonZeroU32::new_unchecked(1)),
+            key01: UnsafeCell::new([NonZeroU32::new_unchecked(1); 2]),
+            key1: UnsafeCell::new([[NonZeroU32::new_unchecked(1); 2]; 2]),
+            value: UnsafeCell::new(MaybeUninit::uninit()),
         }
-    }
+    };
     /// safety: self.value must not be concurrently accessed by any other threads
-    unsafe fn get_value_mut_ptr(&self) -> *mut Value {
+    unsafe fn get_value_mut_ptr(&self) -> *mut LocalTableValues<EarlyValue, LateValue> {
         (*self.value.get()).as_mut_ptr()
     }
     /// safety: self.value must not be concurrently written by any other threads
-    unsafe fn get_value_ptr(&self) -> *const Value {
+    unsafe fn get_value_ptr(&self) -> *const LocalTableValues<EarlyValue, LateValue> {
         (*self.value.get()).as_ptr()
     }
 }
 
-impl<Value> Drop for LocalTableEntry<Value> {
+impl<EarlyValue: 'static, LateValue: Copy + 'static> Drop
+    for LocalTableEntry<EarlyValue, LateValue>
+{
     fn drop(&mut self) {
         unsafe {
             if (&*self.key000.get()).is_some() {
@@ -46,11 +87,14 @@ impl<Value> Drop for LocalTableEntry<Value> {
     }
 }
 
-impl<Value> TableEntry<Value> for LocalTableEntry<Value> {
+impl<EarlyValue: 'static, LateValue: Copy + 'static> TableEntry
+    for LocalTableEntry<EarlyValue, LateValue>
+{
+    type Values = LocalTableValues<EarlyValue, LateValue>;
     fn empty() -> Self {
-        LocalTableEntry::empty()
+        LocalTableEntry::EMPTY
     }
-    fn get(&self) -> Option<(Key, &Value)> {
+    fn get(&self) -> Option<(Key, &Self::Values)> {
         unsafe {
             let key000 = (*self.key000.get())?;
             let key001 = *self.key001.get();
@@ -60,7 +104,11 @@ impl<Value> TableEntry<Value> for LocalTableEntry<Value> {
             Some((Key([[[key000, key001], key01], key1]), value_ref))
         }
     }
-    fn fill(&self, key: Key, value: Value) -> Result<&Value, AlreadyFull<Value>> {
+    fn fill(
+        &self,
+        key: Key,
+        value: Self::Values,
+    ) -> Result<&Self::Values, AlreadyFull<Self::Values>> {
         if let Some((entry_key, entry_value)) = self.get() {
             Err(AlreadyFull {
                 passed_in_value: value,
@@ -79,7 +127,7 @@ impl<Value> TableEntry<Value> for LocalTableEntry<Value> {
             }
         }
     }
-    fn take(&mut self) -> Option<(Key, Value)> {
+    fn take(&mut self) -> Option<(Key, Self::Values)> {
         unsafe {
             let key000 = ((&mut *self.key000.get()).take())?;
             let key001 = *self.key001.get();

@@ -1,7 +1,6 @@
 use std::hash::BuildHasher;
 use std::hash::Hash;
 use std::hash::Hasher;
-use std::marker::PhantomData;
 use std::num::NonZeroU32;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
@@ -14,24 +13,48 @@ pub use local::LocalTableEntry;
 pub use sync::SyncTableEntry;
 
 #[derive(Debug)]
+pub struct LateValueAlreadySet<'a, LateValue> {
+    pub passed_in_value: LateValue,
+    pub value: &'a LateValue,
+}
+
+#[derive(Debug)]
 pub struct AlreadyFull<'a, Value: 'static> {
     pub passed_in_value: Value,
     pub entry_key: Key,
     pub entry_value: &'a Value,
 }
 
-pub trait TableEntry<Value: Sized + 'static> {
-    fn empty() -> Self;
-    fn get(&self) -> Option<(Key, &Value)>;
-    fn fill(&self, key: Key, value: Value) -> Result<&Value, AlreadyFull<Value>>;
-    fn take(&mut self) -> Option<(Key, Value)>;
+pub trait TableEntryValues:
+    Into<(
+        <Self as TableEntryValues>::EarlyValue,
+        Option<<Self as TableEntryValues>::LateValue>,
+    )> + 'static
+{
+    type LateValue: Copy + 'static;
+    type EarlyValue: Sized + 'static;
+    fn new(early_value: Self::EarlyValue, late_value: Option<Self::LateValue>) -> Self;
+    fn early_value(&self) -> &Self::EarlyValue;
+    fn late_value(&self) -> Option<Self::LateValue>;
+    fn set_late_value(&self, late_value: Option<Self::LateValue>);
 }
 
-pub struct HashTable<Value: Sized + 'static, Entry: TableEntry<Value>, BH: BuildHasher> {
+pub trait TableEntry {
+    type Values: TableEntryValues;
+    fn empty() -> Self;
+    fn get(&self) -> Option<(Key, &Self::Values)>;
+    fn fill(
+        &self,
+        key: Key,
+        value: Self::Values,
+    ) -> Result<&Self::Values, AlreadyFull<Self::Values>>;
+    fn take(&mut self) -> Option<(Key, Self::Values)>;
+}
+
+pub struct HashTable<Entry: TableEntry, BH: BuildHasher> {
     table: Option<Box<[Entry]>>,
     hasher: BH,
     insert_search_limit: usize,
-    _phantom: PhantomData<Value>,
 }
 
 #[derive(Debug)]
@@ -70,41 +93,35 @@ impl Iterator for TableIndexIter {
     }
 }
 
-pub struct HashTableDrain<'a, Value: Sized + 'static, Entry: TableEntry<Value>> {
+pub struct HashTableDrain<'a, Entry: TableEntry> {
     entry_iter: std::slice::IterMut<'a, Entry>,
-    _phantom: PhantomData<&'a mut Value>,
 }
 
-impl<Value: Sized + 'static, Entry: TableEntry<Value>> Iterator
-    for HashTableDrain<'_, Value, Entry>
-{
-    type Item = (Key, Value);
-    fn next(&mut self) -> Option<(Key, Value)> {
+impl<Entry: TableEntry> Iterator for HashTableDrain<'_, Entry> {
+    type Item = (Key, Entry::Values);
+    fn next(&mut self) -> Option<(Key, Entry::Values)> {
         self.entry_iter.next().and_then(TableEntry::take)
     }
 }
 
-impl<Value: Sized + 'static, Entry: TableEntry<Value>> Drop for HashTableDrain<'_, Value, Entry> {
+impl<Entry: TableEntry> Drop for HashTableDrain<'_, Entry> {
     fn drop(&mut self) {
         self.for_each(std::mem::drop);
     }
 }
 
-pub struct HashTableIter<'a, Value: Sized + 'static, Entry: TableEntry<Value>> {
+pub struct HashTableIter<'a, Entry: TableEntry> {
     entry_iter: std::slice::Iter<'a, Entry>,
-    _phantom: PhantomData<&'a Value>,
 }
 
-impl<'a, Value: Sized + 'static, Entry: TableEntry<Value>> Iterator
-    for HashTableIter<'a, Value, Entry>
-{
-    type Item = (Key, &'a Value);
-    fn next(&mut self) -> Option<(Key, &'a Value)> {
+impl<'a, Entry: TableEntry> Iterator for HashTableIter<'a, Entry> {
+    type Item = (Key, &'a Entry::Values);
+    fn next(&mut self) -> Option<(Key, &'a Entry::Values)> {
         self.entry_iter.next().and_then(TableEntry::get)
     }
 }
 
-impl<Entry: TableEntry<Value>, BH: BuildHasher, Value: 'static> HashTable<Value, Entry, BH> {
+impl<Entry: TableEntry, BH: BuildHasher> HashTable<Entry, BH> {
     pub fn with_search_limit_and_hasher(
         mut capacity: usize,
         insert_search_limit: usize,
@@ -117,7 +134,6 @@ impl<Entry: TableEntry<Value>, BH: BuildHasher, Value: 'static> HashTable<Value,
             table: Some((0..capacity).map(|_| Entry::empty()).collect()),
             hasher,
             insert_search_limit,
-            _phantom: PhantomData,
         }
     }
     pub fn with_hasher(capacity: usize, hasher: BH) -> Self {
@@ -164,7 +180,7 @@ impl<Entry: TableEntry<Value>, BH: BuildHasher, Value: 'static> HashTable<Value,
         }
         .take(self.capacity().min(limit))
     }
-    pub fn find(&self, key: Key) -> Option<&Value> {
+    pub fn find(&self, key: Key) -> Option<&Entry::Values> {
         let table = self.get_table();
         for table_index in self.table_indexes(key, usize::max_value()) {
             let (entry_key, entry_value) = table[table_index].get()?;
@@ -174,7 +190,11 @@ impl<Entry: TableEntry<Value>, BH: BuildHasher, Value: 'static> HashTable<Value,
         }
         None
     }
-    pub fn insert(&self, key: Key, mut value: Value) -> Result<&Value, InsertFailureReason<Value>> {
+    pub fn insert(
+        &self,
+        key: Key,
+        mut value: Entry::Values,
+    ) -> Result<&Entry::Values, InsertFailureReason<Entry::Values>> {
         let table = self.get_table();
         for table_index in self.table_indexes(key, self.insert_search_limit) {
             match table[table_index].fill(key, value) {
@@ -201,8 +221,8 @@ impl<Entry: TableEntry<Value>, BH: BuildHasher, Value: 'static> HashTable<Value,
     pub fn get_or_insert(
         &self,
         key: Key,
-        value: Value,
-    ) -> Result<GetOrInsertSuccess<Value>, GetOrInsertFailureReason<Value>> {
+        value: Entry::Values,
+    ) -> Result<GetOrInsertSuccess<Entry::Values>, GetOrInsertFailureReason<Entry::Values>> {
         match self.insert(key, value) {
             Ok(entry_value) => Ok(GetOrInsertSuccess {
                 entry_value,
@@ -220,16 +240,14 @@ impl<Entry: TableEntry<Value>, BH: BuildHasher, Value: 'static> HashTable<Value,
             }
         }
     }
-    pub fn drain(&mut self) -> HashTableDrain<Value, Entry> {
+    pub fn drain(&mut self) -> HashTableDrain<Entry> {
         HashTableDrain {
             entry_iter: self.get_table_mut().iter_mut(),
-            _phantom: PhantomData,
         }
     }
-    pub fn iter(&self) -> HashTableIter<Value, Entry> {
+    pub fn iter(&self) -> HashTableIter<Entry> {
         HashTableIter {
             entry_iter: self.get_table().iter(),
-            _phantom: PhantomData,
         }
     }
 }
@@ -255,15 +273,18 @@ mod tests {
 
     #[test]
     fn test_sync_table_entry() {
-        test_table_entry::<SyncTableEntry<DropCounter>>()
+        test_table_entry::<SyncTableEntry<DropCounter, NonZeroU32>>()
     }
 
     #[test]
     fn test_local_table_entry() {
-        test_table_entry::<LocalTableEntry<DropCounter>>()
+        test_table_entry::<LocalTableEntry<DropCounter, NonZeroU32>>()
     }
 
-    fn test_table_entry<T: TableEntry<DropCounter>>() {
+    fn test_table_entry<T: TableEntry>()
+    where
+        T::Values: TableEntryValues<EarlyValue = DropCounter, LateValue = NonZeroU32>,
+    {
         #![allow(clippy::cognitive_complexity)]
         let drop_count = Arc::new(AtomicUsize::new(0));
         let key = Key([
@@ -282,35 +303,47 @@ mod tests {
         let fill1_result = table_entry
             .fill(
                 key,
-                DropCounter {
-                    drop_count: drop_count.clone(),
-                },
+                T::Values::new(
+                    DropCounter {
+                        drop_count: drop_count.clone(),
+                    },
+                    None,
+                ),
             )
-            .unwrap();
+            .ok()
+            .unwrap()
+            .early_value();
         assert_eq!(drop_count.load(Ordering::Relaxed), 0);
         let load1_result = table_entry.get().unwrap();
         assert_eq!(load1_result.0, key);
-        assert_eq!(load1_result.1 as *const _, fill1_result);
+        assert_eq!(load1_result.1.early_value() as *const _, fill1_result);
         assert_eq!(drop_count.load(Ordering::Relaxed), 0);
         let drop_count2 = Arc::new(AtomicUsize::new(0));
         let fill2_result = table_entry
             .fill(
                 key,
-                DropCounter {
-                    drop_count: drop_count2.clone(),
-                },
+                T::Values::new(
+                    DropCounter {
+                        drop_count: drop_count2.clone(),
+                    },
+                    None,
+                ),
             )
-            .unwrap_err();
+            .err()
+            .unwrap();
         assert_eq!(drop_count.load(Ordering::Relaxed), 0);
         assert_eq!(drop_count2.load(Ordering::Relaxed), 0);
         std::mem::drop(fill2_result.passed_in_value);
         assert_eq!(drop_count.load(Ordering::Relaxed), 0);
         assert_eq!(drop_count2.load(Ordering::Relaxed), 1);
         assert_eq!(fill2_result.entry_key, key);
-        assert_eq!(fill2_result.entry_value as *const _, fill1_result);
+        assert_eq!(
+            fill2_result.entry_value.early_value() as *const _,
+            fill1_result
+        );
         let load2_result = table_entry.get().unwrap();
         assert_eq!(load2_result.0, key);
-        assert_eq!(load2_result.1 as *const _, fill1_result);
+        assert_eq!(load2_result.1.early_value() as *const _, fill1_result);
         assert_eq!(drop_count.load(Ordering::Relaxed), 0);
         assert_eq!(drop_count2.load(Ordering::Relaxed), 1);
         std::mem::drop(table_entry);
@@ -320,10 +353,14 @@ mod tests {
         table_entry
             .fill(
                 key,
-                DropCounter {
-                    drop_count: drop_count.clone(),
-                },
+                T::Values::new(
+                    DropCounter {
+                        drop_count: drop_count.clone(),
+                    },
+                    None,
+                ),
             )
+            .ok()
             .unwrap();
         assert_eq!(drop_count.load(Ordering::Relaxed), 1);
         let take_result = table_entry.take().unwrap();

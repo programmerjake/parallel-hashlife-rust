@@ -1,24 +1,74 @@
-use super::AlreadyFull;
-use super::Key;
-use super::TableEntry;
+use crate::hashtable_base::AlreadyFull;
+use crate::hashtable_base::Key;
+use crate::hashtable_base::TableEntry;
+use crate::hashtable_base::TableEntryValues;
 use std::cell::UnsafeCell;
+use std::marker::PhantomData;
 use std::mem::MaybeUninit;
 use std::num::NonZeroU32;
 use std::ptr::drop_in_place;
 use std::sync::atomic::spin_loop_hint;
+use std::sync::atomic::AtomicU32;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
-pub struct SyncTableEntry<Value: 'static> {
+/// `LateValue` must be `NonZeroU32`
+pub struct SyncTableValues<EarlyValue: 'static, LateValue: Copy + 'static> {
+    early_value: EarlyValue,
+    late_value: AtomicU32,
+    _phantom: PhantomData<LateValue>,
+}
+
+impl<EarlyValue: 'static> TableEntryValues for SyncTableValues<EarlyValue, NonZeroU32> {
+    type LateValue = NonZeroU32;
+    type EarlyValue = EarlyValue;
+    fn new(early_value: Self::EarlyValue, late_value: Option<Self::LateValue>) -> Self {
+        Self {
+            early_value,
+            late_value: AtomicU32::new(late_value.map(NonZeroU32::get).unwrap_or(0)),
+            _phantom: PhantomData,
+        }
+    }
+    fn early_value(&self) -> &Self::EarlyValue {
+        &self.early_value
+    }
+    fn late_value(&self) -> Option<Self::LateValue> {
+        NonZeroU32::new(self.late_value.load(Ordering::Acquire))
+    }
+    fn set_late_value(&self, late_value: Option<Self::LateValue>) {
+        self.late_value.store(
+            late_value.map(NonZeroU32::get).unwrap_or(0),
+            Ordering::Release,
+        );
+    }
+}
+
+impl<EarlyValue: 'static> Into<(EarlyValue, Option<NonZeroU32>)>
+    for SyncTableValues<EarlyValue, NonZeroU32>
+{
+    fn into(self) -> (EarlyValue, Option<NonZeroU32>) {
+        let Self {
+            early_value,
+            late_value,
+            _phantom,
+        } = self;
+        (early_value, NonZeroU32::new(late_value.into_inner()))
+    }
+}
+
+pub struct SyncTableEntry<EarlyValue: 'static, LateValue: Copy + 'static> {
     state: AtomicU64,
     key01: UnsafeCell<[NonZeroU32; 2]>,
     key1: UnsafeCell<[[NonZeroU32; 2]; 2]>,
-    value: UnsafeCell<MaybeUninit<Value>>,
+    value: UnsafeCell<MaybeUninit<SyncTableValues<EarlyValue, LateValue>>>,
 }
 
-unsafe impl<Value: Sync> Sync for SyncTableEntry<Value> {}
+unsafe impl<EarlyValue: 'static + Send + Sync, LateValue: Copy + 'static + Send + Sync> Sync
+    for SyncTableEntry<EarlyValue, LateValue>
+{
+}
 
-impl<Value> Drop for SyncTableEntry<Value> {
+impl<EarlyValue, LateValue: Copy> Drop for SyncTableEntry<EarlyValue, LateValue> {
     fn drop(&mut self) {
         match State::from(*self.state.get_mut()) {
             State::Empty => {}
@@ -88,32 +138,36 @@ impl From<u64> for State {
     }
 }
 
-impl<Value> SyncTableEntry<Value> {
-    pub const fn empty() -> Self {
-        unsafe {
-            Self {
-                state: AtomicU64::new(0),
-                key01: UnsafeCell::new([NonZeroU32::new_unchecked(1); 2]),
-                key1: UnsafeCell::new([[NonZeroU32::new_unchecked(1); 2]; 2]),
-                value: UnsafeCell::new(MaybeUninit::uninit()),
-            }
+impl<EarlyValue: 'static, LateValue: 'static + Copy> SyncTableEntry<EarlyValue, LateValue> {
+    pub const EMPTY: Self = unsafe {
+        Self {
+            state: AtomicU64::new(0),
+            key01: UnsafeCell::new([NonZeroU32::new_unchecked(1); 2]),
+            key1: UnsafeCell::new([[NonZeroU32::new_unchecked(1); 2]; 2]),
+            value: UnsafeCell::new(MaybeUninit::uninit()),
         }
-    }
+    };
     /// safety: self.value must not be concurrently accessed by any other threads
-    unsafe fn get_value_mut_ptr(&self) -> *mut Value {
+    unsafe fn get_value_mut_ptr(&self) -> *mut SyncTableValues<EarlyValue, LateValue> {
         (*self.value.get()).as_mut_ptr()
     }
     /// safety: self.value must not be concurrently written by any other threads
-    unsafe fn get_value_ptr(&self) -> *const Value {
+    unsafe fn get_value_ptr(&self) -> *const SyncTableValues<EarlyValue, LateValue> {
         (*self.value.get()).as_ptr()
     }
 }
 
-impl<Value> TableEntry<Value> for SyncTableEntry<Value> {
+impl<EarlyValue: 'static, LateValue: Copy + 'static> TableEntry
+    for SyncTableEntry<EarlyValue, LateValue>
+where
+    SyncTableValues<EarlyValue, LateValue>:
+        TableEntryValues<EarlyValue = EarlyValue, LateValue = LateValue>,
+{
+    type Values = SyncTableValues<EarlyValue, LateValue>;
     fn empty() -> Self {
-        SyncTableEntry::empty()
+        SyncTableEntry::EMPTY
     }
-    fn get(&self) -> Option<(Key, &Value)> {
+    fn get(&self) -> Option<(Key, &Self::Values)> {
         let mut backoff_step = 0;
         let key00 = loop {
             match State::from(self.state.load(Ordering::Acquire)) {
@@ -138,7 +192,11 @@ impl<Value> TableEntry<Value> for SyncTableEntry<Value> {
             Some((Key([[key00, key01], key1]), &*self.get_value_ptr()))
         }
     }
-    fn fill(&self, key: Key, value: Value) -> Result<&Value, AlreadyFull<Value>> {
+    fn fill(
+        &self,
+        key: Key,
+        value: Self::Values,
+    ) -> Result<&Self::Values, AlreadyFull<Self::Values>> {
         loop {
             match self
                 .state
@@ -190,7 +248,7 @@ impl<Value> TableEntry<Value> for SyncTableEntry<Value> {
             Ok(&*self.get_value_ptr())
         }
     }
-    fn take(&mut self) -> Option<(Key, Value)> {
+    fn take(&mut self) -> Option<(Key, Self::Values)> {
         unsafe {
             match State::from(*self.state.get_mut()) {
                 State::Empty => None,
